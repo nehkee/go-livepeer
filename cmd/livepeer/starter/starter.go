@@ -112,6 +112,7 @@ type LivepeerConfig struct {
 	UseLiveRunners             *bool
 	LiveRunnerConfig           *string
 	LiveRunnerProxyURL         *string
+	LiveRunnerIdleTimeout      *time.Duration
 	Gateway                    *bool
 	Broadcaster                *bool
 	OrchSecret                 *string
@@ -258,6 +259,7 @@ func DefaultLivepeerConfig() LivepeerConfig {
 	defaultUseLiveRunners := false
 	defaultLiveRunnerConfig := ""
 	defaultLiveRunnerProxyURL := ""
+	defaultLiveRunnerIdleTimeout := time.Duration(0)
 	defaultAIModels := ""
 	defaultAIModelsDir := ""
 	defaultAIVerboseLogs := false
@@ -390,6 +392,7 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		UseLiveRunners:           &defaultUseLiveRunners,
 		LiveRunnerConfig:         &defaultLiveRunnerConfig,
 		LiveRunnerProxyURL:       &defaultLiveRunnerProxyURL,
+		LiveRunnerIdleTimeout:    &defaultLiveRunnerIdleTimeout,
 		AIModels:                 &defaultAIModels,
 		AIModelsDir:              &defaultAIModelsDir,
 		AIVerboseLogs:            &defaultAIVerboseLogs,
@@ -2057,10 +2060,18 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 					glog.Exitf("invalid -liveRunnerProxyUrl: %v", err)
 				}
 			}
+			var sessionIdleTimeout time.Duration
+			if cfg.LiveRunnerIdleTimeout != nil {
+				sessionIdleTimeout = *cfg.LiveRunnerIdleTimeout
+			}
+			if sessionIdleTimeout < 0 {
+				glog.Exit("invalid -liveRunnerSessionIdleTimeout: must not be negative")
+			}
 			n.LiveRunnerManager = runner.NewLiveRunnerRegistry(runner.LiveRunnerRegistryConfig{
-				Host:             liveRunnerHost{RunnerHost: orch, LivepeerNode: n},
-				Onchain:          *cfg.Network != "offchain",
-				ProxyURLTemplate: *cfg.LiveRunnerProxyURL,
+				Host:               liveRunnerHost{RunnerHost: orch, LivepeerNode: n},
+				Onchain:            *cfg.Network != "offchain",
+				ProxyURLTemplate:   *cfg.LiveRunnerProxyURL,
+				SessionIdleTimeout: sessionIdleTimeout,
 			})
 			if n.OrchSecret == "" {
 				glog.Warning("No -orchSecret configured; dynamic LiveRunner heartbeat registration is disabled")

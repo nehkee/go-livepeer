@@ -68,7 +68,7 @@ Registration declares one of two modes:
 
 | Mode | Lifecycle | Typical use |
 | --- | --- | --- |
-| `persistent` | A client reserves a session, makes one or more requests, and explicitly stops the session. | Realtime video, long-lived SSE or WebSocket connections, and stateful applications. |
+| `persistent` | A client reserves a session, makes one or more requests, and explicitly stops the session. An optional idle timeout releases abandoned sessions. | Realtime video, long-lived SSE or WebSocket connections, and stateful applications. |
 | `single-shot` | The orchestrator reserves a session for one proxied request and releases it when that request finishes. | Stateless HTTP request/response and fast batch inference. |
 
 The default is `persistent`. The spelling `single_shot` is accepted during
@@ -79,6 +79,36 @@ several HTTP requests, WebSockets, proxies, and trickle channels while consuming
 one capacity slot. A single-shot request consumes one slot for the duration of
 that request. Reserving beyond the advertised capacity returns `503 Service
 Unavailable`.
+
+#### Idle persistent sessions
+
+A persistent session normally ends only when it is stopped, when payment fails,
+or when its runner goes away. A client that disappears without stopping its
+session, for example offchain or with fixed-price payment, would otherwise hold
+the runner's capacity until the runner re-registers. Set
+`-liveRunnerSessionIdleTimeout` (for example `10m`) to release persistent
+sessions that have had no client requests in flight for that long. The default,
+`0`, disables the timeout.
+
+- The idle clock starts when the session is reserved, so a reservation that is
+  never used also expires.
+- Client requests count while they are in flight: requests to the session's
+  `/apps/{runner_id}/session/{session_id}/app/...` URL, to its generated proxy
+  URLs, and to its trickle channels. Long polls, SSE, WebSocket and trickle
+  streams stay in flight until they finish or disconnect, so a stream can run
+  longer than the timeout.
+- When the last overlapping request finishes, the idle clock restarts. The
+  timeout is measured from when that request finished, not from when it arrived.
+- A request that arrives at or after the deadline cannot revive the session; it
+  gets `404` and the session is released.
+- Runner heartbeats, runner callbacks and payments do not count. Trickle
+  requests that arrive on a separate `-liveRunnerAddr` origin are runner traffic
+  and do not count either. When runners and clients share one origin, every
+  trickle request on the session's channels counts.
+- Single-shot sessions are not affected; they end with their request.
+
+An idle session is released through the normal release path, which frees its
+capacity, closes its channels and proxies, and sends the `released` o2r event.
 
 ### Static and dynamic registration
 
@@ -435,6 +465,7 @@ remote signer flags remain documented with their owning features.
 | `-liveRunnerConfig` | empty | Path to a static JSON configuration loaded at startup. Setting it also initializes live-runner support. |
 | `-liveRunnerAddr` | empty; falls back to service URI | Absolute HTTP(S) base URL runners use for heartbeat responses, session control, and internal trickle URLs. Useful for container/cluster networking. |
 | `-liveRunnerProxyUrl` | `{service URI}/run/{proxy}` | Absolute HTTP(S) public proxy template containing exactly one `{proxy}` in the host or final path segment. |
+| `-liveRunnerSessionIdleTimeout` | `0` (disabled) | Releases a persistent session after it has had no client requests or client trickle traffic in flight for this duration. See [Idle persistent sessions](#idle-persistent-sessions). |
 | `-orchSecret` | empty | Bootstrap `Authorization` value for dynamic registration. Static-only registration can run without it. The value can also be a path according to the general orchestrator-secret behavior. |
 | `-serviceAddr` | empty | Public orchestrator URI used in discovery and ordinary `/apps` URLs. It must be configured or otherwise available through the node's advertised service URI. |
 

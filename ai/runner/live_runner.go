@@ -248,6 +248,10 @@ type liveRunnerSession struct {
 	priceInfo LiveRunnerPriceInfo
 	channels  map[string]*liveRunnerTrickleChannel
 	proxies   map[string]proxyTarget
+	// activeRequests counts in-flight client requests for the idle timeout.
+	// idleSince is set at reservation and whenever activeRequests drops to zero.
+	activeRequests int
+	idleSince      time.Time
 }
 
 type proxyTarget struct {
@@ -271,6 +275,7 @@ type LiveRunnerRegistry struct {
 	healthClient      *http.Client
 	healthInterval    time.Duration
 	o2rInterval       time.Duration
+	sessionIdleTTL    time.Duration
 	stopRegistry      chan struct{}
 	stopRegistryOnce  sync.Once
 
@@ -296,6 +301,9 @@ type LiveRunnerRegistryConfig struct {
 	Onchain          bool
 	ProxyURLTemplate string
 	O2RInterval      time.Duration
+	// SessionIdleTimeout releases a persistent session that has had no client
+	// requests in flight for this long. Zero disables the timeout.
+	SessionIdleTimeout time.Duration
 }
 
 var liveRunnerChannelNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -332,6 +340,7 @@ func NewLiveRunnerRegistry(config LiveRunnerRegistryConfig) *LiveRunnerRegistry 
 		healthClient:      &http.Client{Timeout: defaultLiveRunnerHealthTimeout},
 		healthInterval:    defaultLiveRunnerHealthInterval,
 		o2rInterval:       o2rInterval,
+		sessionIdleTTL:    max(config.SessionIdleTimeout, 0),
 		stopRegistry:      make(chan struct{}),
 		proxyTemplate:     proxyTemplate,
 	}
@@ -983,11 +992,14 @@ func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...str
 			id = "session_" + randomStr(liveRunnerIDRandomBytes)
 		}
 	}
+	now := time.Now()
 	session := &liveRunnerSession{
-		createdAt: time.Now(),
+		createdAt: now,
 		priceInfo: runner.PriceInfo,
 		channels:  make(map[string]*liveRunnerTrickleChannel),
 		proxies:   make(map[string]proxyTarget),
+		// The idle clock starts at reservation, so an unused reservation expires.
+		idleSince: now,
 	}
 	appURL := r.host.ServiceURI().JoinPath("apps", runner.route, "session", id, "app").String()
 	if runner.Mode == LiveRunnerModeSingleShot {
@@ -1389,6 +1401,7 @@ func (r *LiveRunnerRegistry) expiryLoop() {
 		select {
 		case <-ticker.C:
 			r.removeExpiredRunners(time.Now())
+			r.removeIdleSessions(time.Now())
 		case <-r.stopRegistry:
 			return
 		}
@@ -1420,6 +1433,124 @@ func (r *LiveRunnerRegistry) removeExpiredRunners(now time.Time) {
 		}
 		c.runner.mu.Unlock()
 	}
+}
+
+// sessionIdleExpiredLocked requires runner.mu. Only persistent sessions with
+// no in-flight client requests expire, and the deadline itself is inclusive.
+func (r *LiveRunnerRegistry) sessionIdleExpiredLocked(runner *liveRunner, session *liveRunnerSession, now time.Time) bool {
+	return r.sessionIdleTTL > 0 &&
+		runner.Mode != LiveRunnerModeSingleShot &&
+		session.activeRequests == 0 &&
+		!now.Before(session.idleSince.Add(r.sessionIdleTTL))
+}
+
+// releaseIdleSessionLocked requires runner.mu. It releases through the normal
+// release path so capacity is freed and the o2r "released" event is sent.
+func (runner *liveRunner) releaseIdleSessionLocked(sessionID string, idleTTL time.Duration) {
+	slog.Info("live runner session idle timeout", "runner_id", runner.RunnerID, "session_id", sessionID, "app", runner.App, "idle_timeout", idleTTL)
+	runner.releaseSessionLocked(sessionID)
+}
+
+// removeIdleSessions releases persistent sessions whose idle timeout elapsed.
+func (r *LiveRunnerRegistry) removeIdleSessions(now time.Time) {
+	if r.sessionIdleTTL <= 0 {
+		return
+	}
+	r.mu.Lock()
+	runners := make([]*liveRunner, 0, len(r.runners))
+	for _, runner := range r.runners {
+		runners = append(runners, runner)
+	}
+	r.mu.Unlock()
+
+	for _, runner := range runners {
+		runner.mu.Lock()
+		if !runner.removed {
+			for sessionID, session := range runner.sessions {
+				if r.sessionIdleExpiredLocked(runner, session, now) {
+					runner.releaseIdleSessionLocked(sessionID, r.sessionIdleTTL)
+				}
+			}
+		}
+		runner.mu.Unlock()
+	}
+}
+
+// BeginSessionRequest records one in-flight client request for a session and
+// returns a function to call when the request or stream finishes. While any
+// request is in flight the session does not idle out; the idle clock restarts
+// when the last one finishes. The expiry check and the request accounting
+// happen under runner.mu, so a request at or after the idle deadline cannot
+// revive the session: it is released and the request gets 404.
+func (r *LiveRunnerRegistry) BeginSessionRequest(runnerID, sessionID string) (func(), error) {
+	runner, unlock, err := r.lockLiveRunner(runnerID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	// Readiness is left to the request path: proxied requests already require a
+	// ready runner, and trickle channels are served regardless of runner status.
+	session := runner.sessions[sessionID]
+	if session == nil {
+		return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "runner session not found"}
+	}
+	if r.sessionIdleExpiredLocked(runner, session, time.Now()) {
+		runner.releaseIdleSessionLocked(sessionID, r.sessionIdleTTL)
+		return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "runner session not found"}
+	}
+	session.activeRequests++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			// The session may have been released meanwhile; updating its
+			// counters is then harmless.
+			runner.mu.Lock()
+			defer runner.mu.Unlock()
+			session.activeRequests--
+			if session.activeRequests == 0 {
+				session.idleSince = time.Now()
+			}
+		})
+	}, nil
+}
+
+// BeginTrickleRequest records an in-flight client request on a session trickle
+// channel, so active media keeps the session alive. matched is false when the
+// idle timeout is disabled or the channel does not belong to a live runner
+// session; the caller then serves the request without accounting.
+func (r *LiveRunnerRegistry) BeginTrickleRequest(channelName string) (done func(), matched bool, err error) {
+	if r.sessionIdleTTL <= 0 {
+		return nil, false, nil
+	}
+	r.mu.Lock()
+	snapshot := make([]*liveRunner, 0, len(r.runners))
+	for _, runner := range r.runners {
+		snapshot = append(snapshot, runner)
+	}
+	r.mu.Unlock()
+
+	for _, runner := range snapshot {
+		runner.mu.Lock()
+		runnerID, sessionID, found := runner.route, "", false
+		if !runner.removed {
+			for id, session := range runner.sessions {
+				name, ok := strings.CutPrefix(channelName, id+"-")
+				if !ok {
+					continue
+				}
+				if channel := session.channels[name]; channel != nil && channel.channel.ChannelName == channelName {
+					sessionID, found = id, true
+					break
+				}
+			}
+		}
+		runner.mu.Unlock()
+		if found {
+			done, err := r.BeginSessionRequest(runnerID, sessionID)
+			return done, true, err
+		}
+	}
+	return nil, false, nil
 }
 
 func (r *LiveRunnerRegistry) healthLoop() {

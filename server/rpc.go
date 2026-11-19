@@ -204,6 +204,13 @@ func (h *lphttp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if h.tryLiveRunnerProxy(w, r) {
 			return
 		}
+		done, ok := h.beginLiveRunnerTrickleRequest(w, r)
+		if !ok {
+			return
+		}
+		if done != nil {
+			defer done()
+		}
 		h.transRPC.ServeHTTP(w, r)
 	}
 }

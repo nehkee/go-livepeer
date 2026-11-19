@@ -146,6 +146,8 @@ type liveRunnerManager interface {
 	DeleteTrickleChannel(runnerID, sessionID, name string) error
 	CreateSessionProxy(runnerID, sessionID, targetURL string) (runner.LiveRunnerProxy, error)
 	ResolveSessionProxy(host, path string) (runner.LiveRunnerProxyRoute, bool, error)
+	BeginSessionRequest(runnerID, sessionID string) (func(), error)
+	BeginTrickleRequest(channelName string) (func(), bool, error)
 }
 
 func (h *lphttp) liveRunnerManager() (liveRunnerManager, bool) {
@@ -759,6 +761,14 @@ func (h *lphttp) ProxyLiveRunnerSession(w http.ResponseWriter, r *http.Request) 
 
 	runnerID := r.PathValue("runner_id")
 	sessionID := r.PathValue("session_id")
+	// The request counts as session activity until the proxy returns, which
+	// covers long polls, SSE and upgraded WebSocket streams.
+	done, err := manager.BeginSessionRequest(runnerID, sessionID)
+	if err != nil {
+		respondWithLiveRunnerError(w, err)
+		return
+	}
+	defer done()
 	endpoint, err := manager.RunnerEndpointForSession(runnerID, sessionID)
 	if err != nil {
 		respondWithLiveRunnerError(w, err)
@@ -849,8 +859,56 @@ func (h *lphttp) tryLiveRunnerProxy(w http.ResponseWriter, r *http.Request) bool
 		h.transRPC.ServeHTTP(w, localRequest)
 		return true
 	}
+	done, err := manager.BeginSessionRequest(route.RunnerID, route.SessionID)
+	if err != nil {
+		respondWithLiveRunnerError(w, err)
+		return true
+	}
+	defer done()
 	h.proxyLiveRunner(w, r, route.RunnerID, route.SessionID, route.SessionToken, route.TargetURL, route.AppPath)
 	return true
+}
+
+// beginLiveRunnerTrickleRequest counts a client request on a live runner
+// session's trickle channel as session activity for the idle timeout. It
+// returns false when it has already responded. Requests that arrive on a
+// separate -liveRunnerAddr origin are runner traffic and are not counted.
+func (h *lphttp) beginLiveRunnerTrickleRequest(w http.ResponseWriter, r *http.Request) (func(), bool) {
+	channelName, ok := strings.CutPrefix(r.URL.Path, TrickleHTTPPath)
+	if !ok {
+		return nil, true
+	}
+	manager, ok := h.liveRunnerManager()
+	if !ok {
+		return nil, true
+	}
+	channelName, _, _ = strings.Cut(channelName, "/")
+	if channelName == "" || h.isLiveRunnerOriginRequest(r) {
+		return nil, true
+	}
+	done, matched, err := manager.BeginTrickleRequest(channelName)
+	if !matched {
+		return nil, true
+	}
+	if err != nil {
+		respondWithLiveRunnerError(w, err)
+		return nil, false
+	}
+	return done, true
+}
+
+// isLiveRunnerOriginRequest reports whether r arrived on the -liveRunnerAddr
+// origin when that differs from the public service origin.
+func (h *lphttp) isLiveRunnerOriginRequest(r *http.Request) bool {
+	if h.node == nil || h.node.LiveRunnerAddr == nil || h.orchestrator == nil {
+		return false
+	}
+	runnerHost := h.node.LiveRunnerAddr.Host
+	serviceURI := h.orchestrator.ServiceURI()
+	if runnerHost == "" || serviceURI == nil || strings.EqualFold(runnerHost, serviceURI.Host) {
+		return false
+	}
+	return strings.EqualFold(r.Host, runnerHost)
 }
 
 func (h *lphttp) proxyLiveRunner(w http.ResponseWriter, r *http.Request, runnerID, sessionID, sessionToken, endpoint, appPath string) {

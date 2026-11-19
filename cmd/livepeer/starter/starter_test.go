@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/livepeer/go-livepeer/ai/runner"
@@ -510,6 +511,20 @@ func TestNewLivepeerConfig_LiveRunnerProxyURLFlag(t *testing.T) {
 	cfg := NewLivepeerConfig(fs)
 	require.NoError(fs.Parse([]string{"-liveRunnerProxyUrl", "https://{proxy}.example.com"}))
 	require.Equal("https://{proxy}.example.com", *cfg.LiveRunnerProxyURL)
+}
+
+func TestNewLivepeerConfig_LiveRunnerSessionIdleTimeoutFlag(t *testing.T) {
+	require := require.New(t)
+
+	fs := flag.NewFlagSet("livepeer-test", flag.ContinueOnError)
+	cfg := NewLivepeerConfig(fs)
+	require.NoError(fs.Parse(nil))
+	require.Zero(*cfg.LiveRunnerIdleTimeout, "the idle timeout is disabled by default")
+
+	fs = flag.NewFlagSet("livepeer-test", flag.ContinueOnError)
+	cfg = NewLivepeerConfig(fs)
+	require.NoError(fs.Parse([]string{"-liveRunnerSessionIdleTimeout", "10m"}))
+	require.Equal(10*time.Minute, *cfg.LiveRunnerIdleTimeout)
 }
 
 func TestNewLivepeerConfig_LiveRunnerAddrFlag(t *testing.T) {

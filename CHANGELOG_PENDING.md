@@ -20,6 +20,8 @@
 
 #### Orchestrator
 
+- [#4016](https://github.com/livepeer/go-livepeer/issues/4016) Add `-liveRunnerSessionIdleTimeout` to release persistent live runner sessions whose clients have gone away, freeing the runner's capacity (disabled by default)
+
 #### Transcoder
 
 ### Bug Fixes 🐞
